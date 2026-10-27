@@ -29,7 +29,12 @@ cat > "$AGENT" <<EOF
     <string>watch</string>
   </array>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <!-- The watcher retries its own errors, so only restart it after a crash, and not too often. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
+  <key>ThrottleInterval</key><integer>60</integer>
   <key>LimitLoadToSessionType</key><string>Aqua</string>
   <key>ProcessType</key><string>Background</string>
   <key>StandardErrorPath</key><string>$DIR/watcher.log</string>
@@ -38,5 +43,9 @@ cat > "$AGENT" <<EOF
 EOF
 chmod 644 "$AGENT"
 launchctl bootstrap "gui/$UID" "$AGENT"
+
+# A rebuilt binary has a new signature. The watcher never shows Keychain prompts, so grant access here.
+echo "Checking Keychain access (choose Always Allow if macOS asks)…"
+"$DIR/clipvault" list >/dev/null
 
 echo "Done. The watcher is running. See README.md to create the picker shortcut."

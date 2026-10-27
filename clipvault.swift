@@ -1,11 +1,13 @@
 // ClipVault: an encrypted, text-only clipboard history.
 //
 //   clipvault watch   run forever, recording new clipboard text (used by the LaunchAgent)
-//   clipvault list    print one preview line per history item, newest first
-//   clipvault copy    read a preview line on stdin and put that item back on the clipboard
-//   clipvault clear   delete the whole history
+//   clipvault list    print one sanitized preview line per history item, newest first
+//   clipvault copy    read a line from `list` on stdin and put that item back on the clipboard
+//   clipvault clear   delete the history and its encryption key
 //
-// History is AES-256-GCM encrypted with a random key kept in the login Keychain.
+// History is AES-256-GCM encrypted with a random key kept in the login Keychain. The key is
+// replaced daily and deleted by `clear`, so copies of old ciphertext left in APFS snapshots
+// become unreadable.
 
 import AppKit
 import CryptoKit
@@ -14,9 +16,11 @@ import Security
 
 let maxItems = 50
 let maxAge: TimeInterval = 24 * 60 * 60
+let keyLifetime: TimeInterval = 24 * 60 * 60
 let maxBytes = 100_000
 let previewLength = 80
 let pollInterval: TimeInterval = 0.5
+let maintenanceInterval: TimeInterval = 60
 
 // Markers that password managers and other apps put on secrets they copy.
 // See http://nspasteboard.org
@@ -31,105 +35,199 @@ let skippedTypes: Set<String> = [
 let supportDir = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Application Support/ClipVault", isDirectory: true)
 let historyURL = supportDir.appendingPathComponent("history.enc")
+let lockURL = supportDir.appendingPathComponent("history.lock")
 
-struct Entry: Codable {
+struct Entry: Codable, Equatable {
+    var id: String
     var text: String
     var date: Date
 }
 
-func fail(_ message: String) -> Never {
-    FileHandle.standardError.write(Data((message + "\n").utf8))
-    exit(1)
+struct ClipVaultError: Error, CustomStringConvertible {
+    let description: String
+}
+
+func describe(_ error: Error) -> String {
+    (error as? ClipVaultError)?.description ?? error.localizedDescription
+}
+
+func log(_ message: String) {
+    let stamp = ISO8601DateFormatter().string(from: Date())
+    FileHandle.standardError.write(Data("\(stamp) \(message)\n".utf8))
 }
 
 // MARK: - Keychain
 
-let keychainService = "ClipVault"
-let keychainAccount = "history-key"
+let keychainItem: [String: Any] = [
+    kSecClass as String: kSecClassGenericPassword,
+    kSecAttrService as String: "ClipVault",
+    kSecAttrAccount as String: "history-key",
+]
 
-/// Returns the history key, creating it on first use. A new key is only made when
-/// the Keychain says the item doesn't exist, so a locked Keychain never orphans history.
-func loadKey() -> SymmetricKey {
-    let query: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: keychainService,
-        kSecAttrAccount as String: keychainAccount,
-        kSecReturnData as String: true,
-        kSecMatchLimit as String: kSecMatchLimitOne,
-    ]
-    var result: CFTypeRef?
-    let status = SecItemCopyMatching(query as CFDictionary, &result)
-    if status == errSecSuccess, let data = result as? Data, data.count == 32 {
-        return SymmetricKey(data: data)
-    }
-    guard status == errSecItemNotFound else { fail("Keychain read failed (OSStatus \(status))") }
-
-    let key = SymmetricKey(size: .bits256)
-    let add: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: keychainService,
-        kSecAttrAccount as String: keychainAccount,
-        kSecAttrLabel as String: "ClipVault history key",
-        kSecValueData as String: key.withUnsafeBytes { Data($0) },
-    ]
-    let addStatus = SecItemAdd(add as CFDictionary, nil)
-    guard addStatus == errSecSuccess else { fail("Keychain write failed (OSStatus \(addStatus))") }
-    return key
+func keychainError(_ action: String, _ status: OSStatus) -> ClipVaultError {
+    let message = SecCopyErrorMessageString(status, nil) as String? ?? "OSStatus \(status)"
+    let hint = status == errSecAuthFailed || status == errSecInteractionNotAllowed
+        ? " Run `clipvault list` in Terminal and choose Always Allow." : ""
+    return ClipVaultError(description: "Keychain \(action) failed: \(message)\(hint)")
 }
 
-let key = loadKey()
+/// The stored key and when it was last written, or nil if there is no key yet.
+func readKey() throws -> (key: SymmetricKey, date: Date)? {
+    var query = keychainItem
+    query[kSecReturnData as String] = true
+    query[kSecReturnAttributes as String] = true
+    query[kSecMatchLimit as String] = kSecMatchLimitOne
+    var result: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+    if status == errSecItemNotFound { return nil }
+    guard status == errSecSuccess else { throw keychainError("read", status) }
+    guard let item = result as? [String: Any], let data = item[kSecValueData as String] as? Data, data.count == 32
+    else { throw ClipVaultError(description: "Keychain item ClipVault/history-key is malformed") }
+    let date = item[kSecAttrModificationDate as String] as? Date ?? .distantPast
+    return (SymmetricKey(data: data), date)
+}
+
+func storeKey(_ key: SymmetricKey, replacing: Bool) throws {
+    let data = key.withUnsafeBytes { Data($0) }
+    let status: OSStatus
+    if replacing {
+        status = SecItemUpdate(keychainItem as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+    } else {
+        var add = keychainItem
+        add[kSecAttrLabel as String] = "ClipVault history key"
+        add[kSecValueData as String] = data
+        status = SecItemAdd(add as CFDictionary, nil)
+    }
+    guard status == errSecSuccess else { throw keychainError("write", status) }
+}
+
+func deleteKey() throws {
+    let status = SecItemDelete(keychainItem as CFDictionary)
+    guard status == errSecSuccess || status == errSecItemNotFound else { throw keychainError("delete", status) }
+}
 
 // MARK: - Storage
+
+func prepareDirectory() throws {
+    try FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: supportDir.path)
+    // Keep ciphertext out of Time Machine, which also backs up the Keychain that holds old keys.
+    var dir = supportDir
+    var values = URLResourceValues()
+    values.isExcludedFromBackup = true
+    try dir.setResourceValues(values)
+}
+
+/// Runs `body` holding an exclusive lock, so the watcher, the picker and `clear` never interleave.
+func locked<T>(_ body: () throws -> T) throws -> T {
+    try prepareDirectory()
+    let fd = open(lockURL.path, O_CREAT | O_RDWR, 0o600)
+    guard fd >= 0 else { throw ClipVaultError(description: "Could not open lock: \(String(cString: strerror(errno)))") }
+    defer { close(fd) }
+    guard flock(fd, LOCK_EX) == 0 else {
+        throw ClipVaultError(description: "Could not lock history: \(String(cString: strerror(errno)))")
+    }
+    return try body()
+}
 
 func pruned(_ entries: [Entry]) -> [Entry] {
     let cutoff = Date().addingTimeInterval(-maxAge)
     return Array(entries.filter { $0.date > cutoff }.prefix(maxItems))
 }
 
-func load() -> [Entry] {
-    guard let data = try? Data(contentsOf: historyURL) else { return [] }
+/// Decrypts the history. A missing file, or one the key can't open, reads as empty.
+func readHistory(with key: SymmetricKey?) -> [Entry] {
+    guard let key, let data = try? Data(contentsOf: historyURL) else { return [] }
     do {
         let plain = try AES.GCM.open(AES.GCM.SealedBox(combined: data), using: key)
         return pruned(try JSONDecoder().decode([Entry].self, from: plain))
     } catch {
-        FileHandle.standardError.write(Data("History could not be decrypted; starting fresh.\n".utf8))
+        log("History could not be decrypted; starting fresh.")
         return []
     }
 }
 
-func save(_ entries: [Entry]) {
+func writeHistory(_ entries: [Entry], with key: SymmetricKey) throws {
+    let sealed = try AES.GCM.seal(JSONEncoder().encode(entries), using: key)
+    try sealed.combined!.write(to: historyURL, options: .atomic)
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: historyURL.path)
+}
+
+func removeHistory() throws {
     do {
-        try FileManager.default.createDirectory(
-            at: supportDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        let plain = try JSONEncoder().encode(entries)
-        let sealed = try AES.GCM.seal(plain, using: key)
-        try sealed.combined!.write(to: historyURL, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: historyURL.path)
-    } catch {
-        FileHandle.standardError.write(Data("Could not save history: \(error)\n".utf8))
+        try FileManager.default.removeItem(at: historyURL)
+    } catch CocoaError.fileNoSuchFile {
+    }
+}
+
+func snapshot() throws -> [Entry] {
+    try locked { readHistory(with: try readKey()?.key) }
+}
+
+/// Loads, changes, prunes and saves the history under the lock, replacing the key once it is
+/// older than `keyLifetime`. Keychain failures throw before anything on disk is touched.
+func update(_ change: (inout [Entry]) -> Void) throws {
+    try locked {
+        let stored = try readKey()
+        let old = readHistory(with: stored?.key)
+        var entries = old
+        change(&entries)
+        entries = pruned(entries)
+        let expired = stored.map { Date().timeIntervalSince($0.date) > keyLifetime } ?? false
+
+        if entries.isEmpty {
+            try removeHistory()
+            if expired { try deleteKey() }
+            return
+        }
+        if let stored, !expired {
+            if entries != old { try writeHistory(entries, with: stored.key) }
+            return
+        }
+        // The new key is stored first: if that fails, the old file and key are left intact.
+        let key = SymmetricKey(size: .bits256)
+        try storeKey(key, replacing: stored != nil)
+        try writeHistory(entries, with: key)
     }
 }
 
 // MARK: - Previews
 
+/// Drops control and formatting characters (ESC, bidi overrides, zero-width marks…) so a
+/// preview can't inject terminal escape sequences or disguise itself.
+func isPrintable(_ scalar: Unicode.Scalar) -> Bool {
+    switch scalar.properties.generalCategory {
+    case .control, .format, .surrogate, .privateUse, .unassigned, .lineSeparator, .paragraphSeparator:
+        return false
+    default:
+        return true
+    }
+}
+
 func preview(_ text: String) -> String {
-    let flat = text.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).joined(separator: " ")
+    var scalars = String.UnicodeScalarView()
+    scalars.append(contentsOf: text.unicodeScalars.map { isPrintable($0) ? $0 : " " })
+    let flat = String(scalars).split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    if flat.isEmpty { return "(no printable text)" }
     return flat.count > previewLength ? String(flat.prefix(previewLength)) + "…" : flat
 }
 
-/// One unique preview per entry, so a chosen line maps back to exactly one item.
-func previews(_ entries: [Entry]) -> [String] {
-    var seen: [String: Int] = [:]
-    return entries.map { entry in
-        let base = preview(entry.text)
-        seen[base, default: 0] += 1
-        return seen[base]! == 1 ? base : "\(base) (\(seen[base]!))"
+/// A `list` line. The id at the end is stable for the life of the item, so `copy` finds the
+/// right one even if the history changed after the picker opened.
+func line(for entry: Entry) -> String {
+    "\(preview(entry.text))  [\(entry.id)]"
+}
+
+func newID(avoiding entries: [Entry]) -> String {
+    while true {
+        let id = String(format: "%06x", UInt32.random(in: 0..<0x100_0000))
+        if !entries.contains(where: { $0.id == id }) { return id }
     }
 }
 
 // MARK: - Commands
 
-func capture(_ pasteboard: NSPasteboard) {
+func capture(_ pasteboard: NSPasteboard) throws {
     let types = Set((pasteboard.types ?? []).map(\.rawValue))
     guard types.isDisjoint(with: skippedTypes),
           let text = pasteboard.string(forType: .string),
@@ -137,50 +235,91 @@ func capture(_ pasteboard: NSPasteboard) {
           text.utf8.count <= maxBytes
     else { return }
 
-    var entries = load()
-    entries.removeAll { $0.text == text }
-    entries.insert(Entry(text: text, date: Date()), at: 0)
-    save(pruned(entries))
+    try update { entries in
+        let existing = entries.firstIndex { $0.text == text }
+        let id = existing.map { entries[$0].id } ?? newID(avoiding: entries)
+        if let existing { entries.remove(at: existing) }
+        entries.insert(Entry(id: id, text: text, date: Date()), at: 0)
+    }
 }
 
 func watch() -> Never {
+    // A Keychain access prompt would block forever in the background while holding the lock.
+    // Fail instead; running `clipvault list` from Terminal or the shortcut shows the prompt.
+    SecKeychainSetUserInteractionAllowed(false)
+
     let pasteboard = NSPasteboard.general
     var lastChange = pasteboard.changeCount
-    var lastPrune = Date()
+    var lastMaintenance = Date.distantPast
+    var lastError: String?
+
+    // Failures (e.g. a locked Keychain) are retried on the next change or maintenance pass
+    // instead of exiting, and each distinct failure is logged once.
+    func attempt(_ body: () throws -> Void) {
+        do {
+            try body()
+            lastError = nil
+        } catch {
+            let message = describe(error)
+            if message != lastError { log(message) }
+            lastError = message
+        }
+    }
+
     while true {
         Thread.sleep(forTimeInterval: pollInterval)
         autoreleasepool {
             if pasteboard.changeCount != lastChange {
                 lastChange = pasteboard.changeCount
-                capture(pasteboard)
-            } else if Date().timeIntervalSince(lastPrune) > 60 {
-                // Expire old items even when nothing new is copied.
-                lastPrune = Date()
-                if FileManager.default.fileExists(atPath: historyURL.path) { save(load()) }
+                attempt { try capture(pasteboard) }
+            } else if Date().timeIntervalSince(lastMaintenance) > maintenanceInterval {
+                // Expire old items and rotate the key even when nothing new is copied.
+                lastMaintenance = Date()
+                attempt { try update { _ in } }
             }
         }
     }
 }
 
-func list() {
-    print(previews(load()).joined(separator: "\n"))
+func list() throws {
+    print(try snapshot().map(line).joined(separator: "\n"))
 }
 
-func copy() {
-    let input = FileHandle.standardInput.readDataToEndOfFile()
-    let chosen = String(decoding: input, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-    let entries = load()
-    guard let index = previews(entries).firstIndex(of: chosen) else { fail("No history item matches that line.") }
+func copy() throws {
+    let input = String(decoding: FileHandle.standardInput.readDataToEndOfFile(), as: UTF8.self)
+    guard let match = input.firstMatch(of: #/\[([0-9a-f]{6})\]\s*$/#) else {
+        throw ClipVaultError(description: "That line has no history id.")
+    }
+    let id = String(match.1)
+    guard let entry = try snapshot().first(where: { $0.id == id }) else {
+        throw ClipVaultError(description: "That item is no longer in the history.")
+    }
     let pasteboard = NSPasteboard.general
     pasteboard.clearContents()
-    pasteboard.setString(entries[index].text, forType: .string)
+    pasteboard.setString(entry.text, forType: .string)
+}
+
+/// Deletes the file and the key. Either one alone makes the history unreadable, so both are
+/// attempted and every failure is reported.
+func clear() throws {
+    try locked {
+        var failures: [String] = []
+        do { try removeHistory() } catch { failures.append("Could not delete history: \(describe(error))") }
+        do { try deleteKey() } catch { failures.append(describe(error)) }
+        if !failures.isEmpty { throw ClipVaultError(description: failures.joined(separator: "\n")) }
+    }
 }
 
 umask(0o077)
-switch CommandLine.arguments.dropFirst().first {
-case "watch": watch()
-case "list": list()
-case "copy": copy()
-case "clear": try? FileManager.default.removeItem(at: historyURL)
-default: fail("usage: clipvault watch | list | copy | clear")
+do {
+    switch CommandLine.arguments.dropFirst().first {
+    case "watch": watch()
+    case "list": try list()
+    case "copy": try copy()
+    case "clear": try clear()
+    default: throw ClipVaultError(description: "usage: clipvault watch | list | copy | clear")
+    }
+} catch {
+    FileHandle.standardError.write(Data((describe(error) + "\n").utf8))
+    exit(1)
 }
