@@ -7,8 +7,9 @@ An encrypted, text-only clipboard history with a Shortcuts picker.
   (item "ClipVault", account `history-key`). Only ciphertext is written to disk:
   `~/Library/Application Support/ClipVault/history.enc` (folder `700`, file `600`). The folder is
   excluded from Time Machine.
-- The key is replaced every 24 hours and deleted by `clear`. Any old copy of the ciphertext, such as
-  one in an APFS snapshot, can't be decrypted once its key is gone.
+- The key is replaced every 24 hours and deleted by `clear`. Once a key is gone from the live
+  Keychain, old copies of the ciphertext it encrypted can't be decrypted with it. See Limits for the
+  case where a snapshot still holds an old copy of the Keychain.
 - Copies tagged as concealed or transient (1Password, Bitwarden, Apple Passwords and other apps
   that follow nspasteboard.org) are never recorded.
 - The history keeps at most 50 items and drops anything older than 24 hours. Copying the same
@@ -51,7 +52,7 @@ CV="$HOME/Library/Application Support/ClipVault/clipvault"
 "$CV" clear    # delete the history and its key now
 ```
 
-`clear` exits with an error if either deletion fails. To change the limits, edit the constants at the
+`clear` exits with an error if any deletion fails. To change the limits, edit the constants at the
 top of `clipvault.swift` and run `./install.sh` again.
 
 ## Troubleshooting
@@ -59,6 +60,10 @@ top of `clipvault.swift` and run `./install.sh` again.
 The watcher never shows dialogs. If it can't reach the Keychain, it records nothing, writes the
 error once to `~/Library/Application Support/ClipVault/watcher.log`, and keeps retrying. Running
 `"$CV" list` in Terminal brings up the access prompt.
+
+If the history file exists but can't be read or decrypted, ClipVault leaves it untouched and reports
+an error instead of starting over, because the data might still be recoverable. Run `"$CV" clear` to
+discard it and start fresh. Histories from versions without item ids are upgraded automatically.
 
 ## Uninstall
 

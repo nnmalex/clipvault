@@ -6,8 +6,8 @@
 //   clipvault clear   delete the history and its encryption key
 //
 // History is AES-256-GCM encrypted with a random key kept in the login Keychain. The key is
-// replaced daily and deleted by `clear`, so copies of old ciphertext left in APFS snapshots
-// become unreadable.
+// replaced daily and deleted by `clear`, so old ciphertext left on disk can't be decrypted with
+// the live Keychain. (A snapshot of the login Keychain from the same time could still hold it.)
 
 import AppKit
 import CryptoKit
@@ -41,6 +41,20 @@ struct Entry: Codable, Equatable {
     var id: String
     var text: String
     var date: Date
+
+    init(id: String, text: String, date: Date) {
+        self.id = id
+        self.text = text
+        self.date = date
+    }
+
+    // Histories written before ids existed decode with an empty id; loadHistory assigns one.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? ""
+        text = try container.decode(String.self, forKey: .text)
+        date = try container.decode(Date.self, forKey: .date)
+    }
 }
 
 struct ClipVaultError: Error, CustomStringConvertible {
@@ -58,11 +72,18 @@ func log(_ message: String) {
 
 // MARK: - Keychain
 
-let keychainItem: [String: Any] = [
-    kSecClass as String: kSecClassGenericPassword,
-    kSecAttrService as String: "ClipVault",
-    kSecAttrAccount as String: "history-key",
-]
+// During a rotation the new key is stored under `nextKeyAccount` until the file is re-encrypted,
+// so a crash at any point leaves a key that opens the file.
+let currentKeyAccount = "history-key"
+let nextKeyAccount = "history-key-next"
+
+func keychainItem(_ account: String) -> [String: Any] {
+    [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: "ClipVault",
+        kSecAttrAccount as String: account,
+    ]
+}
 
 func keychainError(_ action: String, _ status: OSStatus) -> ClipVaultError {
     let message = SecCopyErrorMessageString(status, nil) as String? ?? "OSStatus \(status)"
@@ -72,8 +93,8 @@ func keychainError(_ action: String, _ status: OSStatus) -> ClipVaultError {
 }
 
 /// The stored key and when it was last written, or nil if there is no key yet.
-func readKey() throws -> (key: SymmetricKey, date: Date)? {
-    var query = keychainItem
+func readKey(_ account: String) throws -> (key: SymmetricKey, date: Date)? {
+    var query = keychainItem(account)
     query[kSecReturnData as String] = true
     query[kSecReturnAttributes as String] = true
     query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -82,18 +103,18 @@ func readKey() throws -> (key: SymmetricKey, date: Date)? {
     if status == errSecItemNotFound { return nil }
     guard status == errSecSuccess else { throw keychainError("read", status) }
     guard let item = result as? [String: Any], let data = item[kSecValueData as String] as? Data, data.count == 32
-    else { throw ClipVaultError(description: "Keychain item ClipVault/history-key is malformed") }
+    else { throw ClipVaultError(description: "Keychain item ClipVault/\(account) is malformed") }
     let date = item[kSecAttrModificationDate as String] as? Date ?? .distantPast
     return (SymmetricKey(data: data), date)
 }
 
-func storeKey(_ key: SymmetricKey, replacing: Bool) throws {
+func storeKey(_ key: SymmetricKey, account: String, replacing: Bool) throws {
     let data = key.withUnsafeBytes { Data($0) }
     let status: OSStatus
     if replacing {
-        status = SecItemUpdate(keychainItem as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        status = SecItemUpdate(keychainItem(account) as CFDictionary, [kSecValueData as String: data] as CFDictionary)
     } else {
-        var add = keychainItem
+        var add = keychainItem(account)
         add[kSecAttrLabel as String] = "ClipVault history key"
         add[kSecValueData as String] = data
         status = SecItemAdd(add as CFDictionary, nil)
@@ -101,8 +122,8 @@ func storeKey(_ key: SymmetricKey, replacing: Bool) throws {
     guard status == errSecSuccess else { throw keychainError("write", status) }
 }
 
-func deleteKey() throws {
-    let status = SecItemDelete(keychainItem as CFDictionary)
+func deleteKey(_ account: String) throws {
+    let status = SecItemDelete(keychainItem(account) as CFDictionary)
     guard status == errSecSuccess || status == errSecItemNotFound else { throw keychainError("delete", status) }
 }
 
@@ -135,16 +156,55 @@ func pruned(_ entries: [Entry]) -> [Entry] {
     return Array(entries.filter { $0.date > cutoff }.prefix(maxItems))
 }
 
-/// Decrypts the history. A missing file, or one the key can't open, reads as empty.
-func readHistory(with key: SymmetricKey?) -> [Entry] {
-    guard let key, let data = try? Data(contentsOf: historyURL) else { return [] }
+func decrypt(_ data: Data, with key: SymmetricKey) -> [Entry]? {
+    guard let box = try? AES.GCM.SealedBox(combined: data),
+          let plain = try? AES.GCM.open(box, using: key)
+    else { return nil }
+    return try? JSONDecoder().decode([Entry].self, from: plain)
+}
+
+/// The history as stored on disk (not yet pruned) and the key it is encrypted with.
+struct History {
+    var entries: [Entry]
+    var key: (key: SymmetricKey, date: Date)?
+}
+
+/// Loads the history, first finishing any key rotation that was interrupted. Call with the lock held.
+/// Only a missing file reads as empty: anything that exists but can't be read or decrypted throws,
+/// so nothing that might be recoverable is ever overwritten.
+func loadHistory() throws -> History {
+    var current = try readKey(currentKeyAccount)
+    let next = try readKey(nextKeyAccount)
+    let data: Data?
     do {
-        let plain = try AES.GCM.open(AES.GCM.SealedBox(combined: data), using: key)
-        return pruned(try JSONDecoder().decode([Entry].self, from: plain))
-    } catch {
-        log("History could not be decrypted; starting fresh.")
-        return []
+        data = try Data(contentsOf: historyURL)
+    } catch CocoaError.fileReadNoSuchFile {
+        data = nil
     }
+
+    if let next {
+        // The rotation stopped after storing the next key. If the file was already re-encrypted
+        // with it, finish by promoting it; otherwise the old key is still the right one.
+        if let data, decrypt(data, with: next.key) != nil {
+            try storeKey(next.key, account: currentKeyAccount, replacing: current != nil)
+            current = (next.key, Date())
+        }
+        try deleteKey(nextKeyAccount)
+    }
+
+    guard let data else { return History(entries: [], key: current) }
+    guard let current, var entries = decrypt(data, with: current.key) else {
+        throw ClipVaultError(description:
+            "History can't be decrypted, so it has been left untouched. Run `clipvault clear` to start over.")
+    }
+    if entries.contains(where: { $0.id.isEmpty }) {
+        for index in entries.indices where entries[index].id.isEmpty {
+            entries[index].id = newID(avoiding: entries)
+        }
+        // Save the new ids now, so `list` and `copy` agree on them.
+        try writeHistory(entries, with: current.key)
+    }
+    return History(entries: entries, key: current)
 }
 
 func writeHistory(_ entries: [Entry], with key: SymmetricKey) throws {
@@ -161,33 +221,40 @@ func removeHistory() throws {
 }
 
 func snapshot() throws -> [Entry] {
-    try locked { readHistory(with: try readKey()?.key) }
+    try locked { pruned(try loadHistory().entries) }
 }
 
 /// Loads, changes, prunes and saves the history under the lock, replacing the key once it is
-/// older than `keyLifetime`. Keychain failures throw before anything on disk is touched.
+/// older than `keyLifetime`.
 func update(_ change: (inout [Entry]) -> Void) throws {
     try locked {
-        let stored = try readKey()
-        let old = readHistory(with: stored?.key)
-        var entries = old
+        let history = try loadHistory()
+        var entries = history.entries
         change(&entries)
         entries = pruned(entries)
-        let expired = stored.map { Date().timeIntervalSince($0.date) > keyLifetime } ?? false
+        let expired = history.key.map { Date().timeIntervalSince($0.date) > keyLifetime } ?? false
 
         if entries.isEmpty {
             try removeHistory()
-            if expired { try deleteKey() }
+            if expired { try deleteKey(currentKeyAccount) }
             return
         }
-        if let stored, !expired {
-            if entries != old { try writeHistory(entries, with: stored.key) }
+        if let current = history.key, !expired {
+            if entries != history.entries { try writeHistory(entries, with: current.key) }
             return
         }
-        // The new key is stored first: if that fails, the old file and key are left intact.
         let key = SymmetricKey(size: .bits256)
-        try storeKey(key, replacing: stored != nil)
+        guard history.key != nil else {
+            // First key: a crash before the write just leaves a key with no history.
+            try storeKey(key, account: currentKeyAccount, replacing: false)
+            try writeHistory(entries, with: key)
+            return
+        }
+        // Rotation. If this stops partway, loadHistory works out which key opens the file.
+        try storeKey(key, account: nextKeyAccount, replacing: false)
         try writeHistory(entries, with: key)
+        try storeKey(key, account: currentKeyAccount, replacing: true)
+        try deleteKey(nextKeyAccount)
     }
 }
 
@@ -281,12 +348,17 @@ func watch() -> Never {
     }
 }
 
+/// Shown instead of a blank picker item. It has no id, so choosing it copies nothing.
+let emptyMarker = "(clipboard history is empty)"
+
 func list() throws {
-    print(try snapshot().map(line).joined(separator: "\n"))
+    let entries = try snapshot()
+    print(entries.isEmpty ? emptyMarker : entries.map(line).joined(separator: "\n"))
 }
 
 func copy() throws {
     let input = String(decoding: FileHandle.standardInput.readDataToEndOfFile(), as: UTF8.self)
+    if input.trimmingCharacters(in: .whitespacesAndNewlines) == emptyMarker { return }
     guard let match = input.firstMatch(of: #/\[([0-9a-f]{6})\]\s*$/#) else {
         throw ClipVaultError(description: "That line has no history id.")
     }
@@ -299,13 +371,15 @@ func copy() throws {
     pasteboard.setString(entry.text, forType: .string)
 }
 
-/// Deletes the file and the key. Either one alone makes the history unreadable, so both are
-/// attempted and every failure is reported.
+/// Deletes the file and the keys without reading them, so it also works on unreadable history.
+/// Either one alone makes the history unreadable, so all are attempted and every failure is reported.
 func clear() throws {
     try locked {
         var failures: [String] = []
         do { try removeHistory() } catch { failures.append("Could not delete history: \(describe(error))") }
-        do { try deleteKey() } catch { failures.append(describe(error)) }
+        for account in [currentKeyAccount, nextKeyAccount] {
+            do { try deleteKey(account) } catch { failures.append(describe(error)) }
+        }
         if !failures.isEmpty { throw ClipVaultError(description: failures.joined(separator: "\n")) }
     }
 }
