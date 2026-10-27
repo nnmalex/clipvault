@@ -8,16 +8,18 @@ DIR="$HOME/Library/Application Support/ClipVault"
 AGENT="$HOME/Library/LaunchAgents/$LABEL.plist"
 failed=0
 
-# Stop the watcher first and make sure it's gone, or it could recreate the history and key.
-if launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; then
-    launchctl bootout "gui/$UID/$LABEL"
-fi
+# Stop the watcher first and make sure both the job and process are gone, or it could recreate
+# the history and key. Verification also handles a failed or interrupted bootout.
+launchctl bootout "gui/$UID/$LABEL" 2>/dev/null
 for _ in {1..20}; do
-    pgrep -qf "$DIR/clipvault watch" || break
+    if ! launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1 && ! pgrep -qf "$DIR/clipvault watch"; then
+        break
+    fi
     sleep 0.25
 done
-if pgrep -qf "$DIR/clipvault watch"; then
-    echo "The watcher is still running, so nothing was removed. Quit it and run this again." >&2
+if launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1 || pgrep -qf "$DIR/clipvault watch"; then
+    echo "The watcher or its LaunchAgent is still active, so nothing was removed." >&2
+    echo "Stop it and run this again." >&2
     exit 1
 fi
 

@@ -12,6 +12,7 @@
 import AppKit
 import CryptoKit
 import Foundation
+import LocalAuthentication
 import Security
 
 let maxItems = 50
@@ -77,12 +78,18 @@ func log(_ message: String) {
 let currentKeyAccount = "history-key"
 let nextKeyAccount = "history-key-next"
 
-func keychainItem(_ account: String) -> [String: Any] {
-    [
+func keychainItem(_ account: String, allowInteraction: Bool) -> [String: Any] {
+    var item: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: "ClipVault",
         kSecAttrAccount as String: account,
     ]
+    if !allowInteraction {
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        item[kSecUseAuthenticationContext as String] = context
+    }
+    return item
 }
 
 func keychainError(_ action: String, _ status: OSStatus) -> ClipVaultError {
@@ -93,8 +100,8 @@ func keychainError(_ action: String, _ status: OSStatus) -> ClipVaultError {
 }
 
 /// The stored key and when it was last written, or nil if there is no key yet.
-func readKey(_ account: String) throws -> (key: SymmetricKey, date: Date)? {
-    var query = keychainItem(account)
+func readKey(_ account: String, allowInteraction: Bool) throws -> (key: SymmetricKey, date: Date)? {
+    var query = keychainItem(account, allowInteraction: allowInteraction)
     query[kSecReturnData as String] = true
     query[kSecReturnAttributes as String] = true
     query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -108,13 +115,15 @@ func readKey(_ account: String) throws -> (key: SymmetricKey, date: Date)? {
     return (SymmetricKey(data: data), date)
 }
 
-func storeKey(_ key: SymmetricKey, account: String, replacing: Bool) throws {
+func storeKey(_ key: SymmetricKey, account: String, replacing: Bool, allowInteraction: Bool) throws {
     let data = key.withUnsafeBytes { Data($0) }
     let status: OSStatus
     if replacing {
-        status = SecItemUpdate(keychainItem(account) as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        status = SecItemUpdate(
+            keychainItem(account, allowInteraction: allowInteraction) as CFDictionary,
+            [kSecValueData as String: data] as CFDictionary)
     } else {
-        var add = keychainItem(account)
+        var add = keychainItem(account, allowInteraction: allowInteraction)
         add[kSecAttrLabel as String] = "ClipVault history key"
         add[kSecValueData as String] = data
         status = SecItemAdd(add as CFDictionary, nil)
@@ -122,8 +131,8 @@ func storeKey(_ key: SymmetricKey, account: String, replacing: Bool) throws {
     guard status == errSecSuccess else { throw keychainError("write", status) }
 }
 
-func deleteKey(_ account: String) throws {
-    let status = SecItemDelete(keychainItem(account) as CFDictionary)
+func deleteKey(_ account: String, allowInteraction: Bool) throws {
+    let status = SecItemDelete(keychainItem(account, allowInteraction: allowInteraction) as CFDictionary)
     guard status == errSecSuccess || status == errSecItemNotFound else { throw keychainError("delete", status) }
 }
 
@@ -172,9 +181,9 @@ struct History {
 /// Loads the history, first finishing any key rotation that was interrupted. Call with the lock held.
 /// Only a missing file reads as empty: anything that exists but can't be read or decrypted throws,
 /// so nothing that might be recoverable is ever overwritten.
-func loadHistory() throws -> History {
-    var current = try readKey(currentKeyAccount)
-    let next = try readKey(nextKeyAccount)
+func loadHistory(allowKeychainInteraction: Bool) throws -> History {
+    var current = try readKey(currentKeyAccount, allowInteraction: allowKeychainInteraction)
+    let next = try readKey(nextKeyAccount, allowInteraction: allowKeychainInteraction)
     let data: Data?
     do {
         data = try Data(contentsOf: historyURL)
@@ -186,10 +195,12 @@ func loadHistory() throws -> History {
         // The rotation stopped after storing the next key. If the file was already re-encrypted
         // with it, finish by promoting it; otherwise the old key is still the right one.
         if let data, decrypt(data, with: next.key) != nil {
-            try storeKey(next.key, account: currentKeyAccount, replacing: current != nil)
+            try storeKey(
+                next.key, account: currentKeyAccount, replacing: current != nil,
+                allowInteraction: allowKeychainInteraction)
             current = (next.key, Date())
         }
-        try deleteKey(nextKeyAccount)
+        try deleteKey(nextKeyAccount, allowInteraction: allowKeychainInteraction)
     }
 
     guard let data else { return History(entries: [], key: current) }
@@ -221,14 +232,14 @@ func removeHistory() throws {
 }
 
 func snapshot() throws -> [Entry] {
-    try locked { pruned(try loadHistory().entries) }
+    try locked { pruned(try loadHistory(allowKeychainInteraction: true).entries) }
 }
 
 /// Loads, changes, prunes and saves the history under the lock, replacing the key once it is
 /// older than `keyLifetime`.
-func update(_ change: (inout [Entry]) -> Void) throws {
+func update(allowKeychainInteraction: Bool, _ change: (inout [Entry]) -> Void) throws {
     try locked {
-        let history = try loadHistory()
+        let history = try loadHistory(allowKeychainInteraction: allowKeychainInteraction)
         var entries = history.entries
         change(&entries)
         entries = pruned(entries)
@@ -236,7 +247,7 @@ func update(_ change: (inout [Entry]) -> Void) throws {
 
         if entries.isEmpty {
             try removeHistory()
-            if expired { try deleteKey(currentKeyAccount) }
+            if expired { try deleteKey(currentKeyAccount, allowInteraction: allowKeychainInteraction) }
             return
         }
         if let current = history.key, !expired {
@@ -246,15 +257,21 @@ func update(_ change: (inout [Entry]) -> Void) throws {
         let key = SymmetricKey(size: .bits256)
         guard history.key != nil else {
             // First key: a crash before the write just leaves a key with no history.
-            try storeKey(key, account: currentKeyAccount, replacing: false)
+            try storeKey(
+                key, account: currentKeyAccount, replacing: false,
+                allowInteraction: allowKeychainInteraction)
             try writeHistory(entries, with: key)
             return
         }
         // Rotation. If this stops partway, loadHistory works out which key opens the file.
-        try storeKey(key, account: nextKeyAccount, replacing: false)
+        try storeKey(
+            key, account: nextKeyAccount, replacing: false,
+            allowInteraction: allowKeychainInteraction)
         try writeHistory(entries, with: key)
-        try storeKey(key, account: currentKeyAccount, replacing: true)
-        try deleteKey(nextKeyAccount)
+        try storeKey(
+            key, account: currentKeyAccount, replacing: true,
+            allowInteraction: allowKeychainInteraction)
+        try deleteKey(nextKeyAccount, allowInteraction: allowKeychainInteraction)
     }
 }
 
@@ -294,7 +311,7 @@ func newID(avoiding entries: [Entry]) -> String {
 
 // MARK: - Commands
 
-func capture(_ pasteboard: NSPasteboard) throws {
+func capture(_ pasteboard: NSPasteboard, allowKeychainInteraction: Bool) throws {
     let types = Set((pasteboard.types ?? []).map(\.rawValue))
     guard types.isDisjoint(with: skippedTypes),
           let text = pasteboard.string(forType: .string),
@@ -302,7 +319,7 @@ func capture(_ pasteboard: NSPasteboard) throws {
           text.utf8.count <= maxBytes
     else { return }
 
-    try update { entries in
+    try update(allowKeychainInteraction: allowKeychainInteraction) { entries in
         let existing = entries.firstIndex { $0.text == text }
         let id = existing.map { entries[$0].id } ?? newID(avoiding: entries)
         if let existing { entries.remove(at: existing) }
@@ -310,39 +327,62 @@ func capture(_ pasteboard: NSPasteboard) throws {
     }
 }
 
-func watch() -> Never {
-    // A Keychain access prompt would block forever in the background while holding the lock.
-    // Fail instead; running `clipvault list` from Terminal or the shortcut shows the prompt.
-    SecKeychainSetUserInteractionAllowed(false)
+struct WatchState {
+    var capturedChange: Int
+    private(set) var failedChange: Int?
+    private(set) var lastCaptureAttempt = Date.distantPast
 
+    func shouldCapture(change: Int, at date: Date) -> Bool {
+        guard change != capturedChange else { return false }
+        return change != failedChange || date.timeIntervalSince(lastCaptureAttempt) >= maintenanceInterval
+    }
+
+    mutating func recordCapture(change: Int, at date: Date, succeeded: Bool) {
+        lastCaptureAttempt = date
+        if succeeded {
+            capturedChange = change
+            failedChange = nil
+        } else {
+            failedChange = change
+        }
+    }
+}
+
+func watch() -> Never {
     let pasteboard = NSPasteboard.general
-    var lastChange = pasteboard.changeCount
+    var state = WatchState(capturedChange: pasteboard.changeCount)
     var lastMaintenance = Date.distantPast
     var lastError: String?
 
     // Failures (e.g. a locked Keychain) are retried on the next change or maintenance pass
     // instead of exiting, and each distinct failure is logged once.
-    func attempt(_ body: () throws -> Void) {
+    func attempt(_ body: () throws -> Void) -> Bool {
         do {
             try body()
             lastError = nil
+            return true
         } catch {
             let message = describe(error)
             if message != lastError { log(message) }
             lastError = message
+            return false
         }
     }
 
     while true {
         Thread.sleep(forTimeInterval: pollInterval)
         autoreleasepool {
-            if pasteboard.changeCount != lastChange {
-                lastChange = pasteboard.changeCount
-                attempt { try capture(pasteboard) }
-            } else if Date().timeIntervalSince(lastMaintenance) > maintenanceInterval {
+            let now = Date()
+            let change = pasteboard.changeCount
+            if state.shouldCapture(change: change, at: now) {
+                let succeeded = attempt {
+                    try capture(pasteboard, allowKeychainInteraction: false)
+                }
+                state.recordCapture(change: change, at: now, succeeded: succeeded)
+            } else if now.timeIntervalSince(lastMaintenance) > maintenanceInterval {
                 // Expire old items and rotate the key even when nothing new is copied.
-                lastMaintenance = Date()
-                attempt { try update { _ in } }
+                lastMaintenance = now
+                _ = attempt { try update(allowKeychainInteraction: false) { _ in } }
             }
         }
     }
@@ -368,7 +408,9 @@ func copy() throws {
     }
     let pasteboard = NSPasteboard.general
     pasteboard.clearContents()
-    pasteboard.setString(entry.text, forType: .string)
+    guard pasteboard.setString(entry.text, forType: .string) else {
+        throw ClipVaultError(description: "The clipboard rejected the selected history item.")
+    }
 }
 
 /// Deletes the file and the keys without reading them, so it also works on unreadable history.
@@ -378,22 +420,8 @@ func clear() throws {
         var failures: [String] = []
         do { try removeHistory() } catch { failures.append("Could not delete history: \(describe(error))") }
         for account in [currentKeyAccount, nextKeyAccount] {
-            do { try deleteKey(account) } catch { failures.append(describe(error)) }
+            do { try deleteKey(account, allowInteraction: true) } catch { failures.append(describe(error)) }
         }
         if !failures.isEmpty { throw ClipVaultError(description: failures.joined(separator: "\n")) }
     }
-}
-
-umask(0o077)
-do {
-    switch CommandLine.arguments.dropFirst().first {
-    case "watch": watch()
-    case "list": try list()
-    case "copy": try copy()
-    case "clear": try clear()
-    default: throw ClipVaultError(description: "usage: clipvault watch | list | copy | clear")
-    }
-} catch {
-    FileHandle.standardError.write(Data((describe(error) + "\n").utf8))
-    exit(1)
 }

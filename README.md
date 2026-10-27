@@ -55,6 +55,12 @@ CV="$HOME/Library/Application Support/ClipVault/clipvault"
 `clear` exits with an error if any deletion fails. To change the limits, edit the constants at the
 top of `clipvault.swift` and run `./install.sh` again.
 
+## Test
+
+```sh
+./test.sh
+```
+
 ## Troubleshooting
 
 The watcher never shows dialogs. If it can't reach the Keychain, it records nothing, writes the
@@ -71,7 +77,7 @@ discard it and start fresh. Histories from versions without item ids are upgrade
 ./uninstall.sh
 ```
 
-This removes the agent, the binary, the history and the Keychain key. Delete the shortcut in Shortcuts.
+This removes the agent, the binary, the history and the Keychain keys. Delete the shortcut in Shortcuts.
 
 ## Limits
 

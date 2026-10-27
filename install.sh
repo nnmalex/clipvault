@@ -12,7 +12,7 @@ mkdir -p "$DIR" build
 chmod 700 "$DIR"
 
 echo "Building clipvault…"
-swiftc -O clipvault.swift -o build/clipvault
+swiftc -O clipvault.swift main.swift -o build/clipvault
 install -m 700 build/clipvault "$DIR/clipvault"
 
 echo "Installing LaunchAgent…"
