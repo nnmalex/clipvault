@@ -61,11 +61,32 @@ top of `clipvault.swift` and run `./install.sh` again.
 ./test.sh
 ```
 
+`test.sh` also starts a watcher against a throwaway Keychain item and folder (via the test-only
+`CLIPVAULT_KEYCHAIN_SERVICE` and `CLIPVAULT_DIR` variables) to check that it fails instead of waiting
+on a Keychain prompt.
+
 ## Troubleshooting
 
 The watcher never shows dialogs. If it can't reach the Keychain, it records nothing, writes the
 error once to `~/Library/Application Support/ClipVault/watcher.log`, and keeps retrying. Running
 `"$CV" list` in Terminal brings up the access prompt.
+
+### Why the watcher uses a deprecated Keychain API
+
+A rebuilt binary has a new signature, so macOS asks before letting it read the existing Keychain
+item. If the background watcher waited on that dialog, it would hold the history lock indefinitely
+and freeze the picker as well. To prevent this, the watcher calls
+`SecKeychainSetUserInteractionAllowed(false)`, which makes Keychain calls fail instead of prompting.
+
+- That function is deprecated, but it's the only switch that covers the login Keychain's "allow
+  access" prompt. `LAContext.interactionNotAllowed` (still passed with background queries) only
+  covers access-control prompts such as Touch ID. Tested on macOS 27.2, the watcher still blocked
+  with it alone.
+- The data-protection Keychain, where `LAContext` would be enough, requires a signed binary with a
+  Keychain entitlement, which a locally built command-line tool doesn't have.
+- The function is looked up at runtime with `dlsym`, so the build has no deprecation warning and
+  `test.sh` can keep `-warnings-as-errors`. If a future macOS removes it, the watcher logs a warning
+  and keeps running, and `test.sh` fails.
 
 If the history file exists but can't be read or decrypted, ClipVault leaves it untouched and reports
 an error instead of starting over, because the data might still be recoverable. Run `"$CV" clear` to

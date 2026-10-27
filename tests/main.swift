@@ -41,11 +41,13 @@ migrated[0].id = "abcdef"
 let roundTrip = try JSONDecoder().decode([Entry].self, from: JSONEncoder().encode(migrated))
 expect(roundTrip[0].id == "abcdef", "migrated id did not persist")
 
-// Noninteractive Keychain operations must use an LAContext instead of a deprecated global switch.
+// Noninteractive Keychain operations carry an LAContext for access-control prompts. The login
+// Keychain's "allow access" prompt needs disableKeychainPrompts; test.sh checks that end to end.
 let interactive = keychainItem("test", allowInteraction: true)
 expect(interactive[kSecUseAuthenticationContext as String] == nil, "interactive query has a context")
 let noninteractive = keychainItem("test", allowInteraction: false)
 let context = noninteractive[kSecUseAuthenticationContext as String] as? LAContext
 expect(context?.interactionNotAllowed == true, "noninteractive query allows interaction")
+expect(disableKeychainPrompts(), "SecKeychainSetUserInteractionAllowed could not be found or called")
 
 print("Swift tests passed.")

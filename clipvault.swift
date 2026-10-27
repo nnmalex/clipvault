@@ -33,8 +33,12 @@ let skippedTypes: Set<String> = [
     "de.petermaurer.TransientPasteboardType",
 ]
 
-let supportDir = FileManager.default.homeDirectoryForCurrentUser
-    .appendingPathComponent("Library/Application Support/ClipVault", isDirectory: true)
+// Overridable only so test.sh can use a throwaway folder and Keychain item.
+let environment = ProcessInfo.processInfo.environment
+let supportDir = environment["CLIPVAULT_DIR"].map { URL(fileURLWithPath: $0, isDirectory: true) }
+    ?? FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/ClipVault", isDirectory: true)
+let keychainService = environment["CLIPVAULT_KEYCHAIN_SERVICE"] ?? "ClipVault"
 let historyURL = supportDir.appendingPathComponent("history.enc")
 let lockURL = supportDir.appendingPathComponent("history.lock")
 
@@ -81,15 +85,33 @@ let nextKeyAccount = "history-key-next"
 func keychainItem(_ account: String, allowInteraction: Bool) -> [String: Any] {
     var item: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: "ClipVault",
+        kSecAttrService as String: keychainService,
         kSecAttrAccount as String: account,
     ]
+    // This covers access-control prompts (Touch ID, passcode). It does NOT stop the login
+    // Keychain's "allow access" prompt; see disableKeychainPrompts for that.
     if !allowInteraction {
         let context = LAContext()
         context.interactionNotAllowed = true
         item[kSecUseAuthenticationContext as String] = context
     }
     return item
+}
+
+/// Makes every Keychain call in this process fail with errSecInteractionNotAllowed instead of showing
+/// a prompt. Without this, a prompt (e.g. after a rebuild changes the binary's signature) blocks the
+/// watcher indefinitely while it holds the history lock, which also freezes the picker.
+///
+/// SecKeychainSetUserInteractionAllowed is deprecated, but it is the only switch that covers the login
+/// Keychain's access prompt: LAContext.interactionNotAllowed doesn't, and the data-protection Keychain
+/// (where LAContext would be enough) requires a signed binary with a Keychain entitlement. It is looked
+/// up at runtime so the build stays free of deprecation warnings under -warnings-as-errors.
+func disableKeychainPrompts() -> Bool {
+    typealias SetUserInteractionAllowed = @convention(c) (UInt8) -> OSStatus
+    // RTLD_DEFAULT is ((void *)-2) on Darwin; Swift doesn't import the macro.
+    guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "SecKeychainSetUserInteractionAllowed")
+    else { return false }
+    return unsafeBitCast(symbol, to: SetUserInteractionAllowed.self)(0) == errSecSuccess
 }
 
 func keychainError(_ action: String, _ status: OSStatus) -> ClipVaultError {
@@ -349,6 +371,10 @@ struct WatchState {
 }
 
 func watch() -> Never {
+    if !disableKeychainPrompts() {
+        log("Could not disable Keychain prompts; an access prompt may block the watcher until answered.")
+    }
+
     let pasteboard = NSPasteboard.general
     var state = WatchState(capturedChange: pasteboard.changeCount)
     var lastMaintenance = Date.distantPast
