@@ -48,4 +48,4 @@ launchctl bootstrap "gui/$UID" "$AGENT"
 echo "Checking Keychain access (choose Always Allow if macOS asks)…"
 "$DIR/clipvault" list >/dev/null
 
-echo "Done. The watcher is running. See README.md to create the picker shortcut."
+echo "Done. The watcher is running. Run './create-shortcut.sh --open' to install the picker shortcut."
